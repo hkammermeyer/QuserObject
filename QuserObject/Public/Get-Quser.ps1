@@ -47,7 +47,8 @@ function Get-Quser {
         [Parameter(
             ParameterSetName = 'Server',
             ValueFromPipeline = $true,
-            ValueFromPipelineByPropertyName = $true
+            ValueFromPipelineByPropertyName = $true,
+            Position = 0
         )]
         [ValidateNotNullOrEmpty()]
         [Alias('__ServerName', 'ServerName', 'Computer', 'Name')]

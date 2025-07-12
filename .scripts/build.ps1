@@ -65,6 +65,7 @@ Properties {
     # Manipulate the Parameters for usage:
     
     $script:Manifest.Copyright = $script:Manifest.Copyright -f [DateTime]::Now.Year
+    $script:Manifest.CmdletsToExport = (Get-ChildItem -Path ('{0}\{1}\{2}\*.ps1' -f $script:PSScriptRootParent, $script:thisModuleName, 'Public') -ErrorAction SilentlyContinue).BaseName
 
     $script:Manifest_ModuleName = $script:Manifest.ModuleName
     $script:Manifest.Remove('ModuleName')
@@ -188,15 +189,16 @@ Task TestModule -Description "Run Pester Tests and CoeCoverage" -Depends Install
     if (Test-Path "$($invokePester.Path)\cultures.json") {
         $invokePester.Add('EnableExit', $true)
         $currentCulture = Get-Culture
+
         foreach ($culture in (Get-Content "$($invokePester.Path)\cultures.json" | ConvertFrom-Json)) {
             Set-Culture -CultureInfo $culture
-            $res = powershell.exe Invoke-Pester @invokePester
-            # Write-Host "[BUILD TestModule] Pester Result: $($res | ConvertTo-Json)" -ForegroundColor Magenta
+            $res = Invoke-Pester @invokePester
+            Write-Host "[BUILD TestModule] Pester Result: $($res | Out-String)" -ForegroundColor Magenta
         }
         Set-Culture -CultureInfo $currentCulture
     } else {
         $res = Invoke-Pester @invokePester
-        # Write-Host "[BUILD TestModule] Pester Result: $($res | ConvertTo-Json)" -ForegroundColor Magenta
+        Write-Host "[BUILD TestModule] Pester Result: $($res | Out-String)" -ForegroundColor Magenta
     }
     
     $exportCodeCovIoJson = @{

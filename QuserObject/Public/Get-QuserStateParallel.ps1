@@ -9,16 +9,15 @@ function Get-QuserStateParallel {
     .DESCRIPTION
         Get-QuserStateParallel uses Get-Quser and the PoshRSJob module to query multiple computers simultaneously.
         It determines an overall state for each computer (e.g., Active, Idle, Empty) based on its collective user sessions.
+        It also calculates the duration a server has been idle or the time remaining until it becomes idle.
 
-        This function requires the PoshRSJob module. You can install it by running:
-        Install-Module -Name PoshRSJob -Scope CurrentUser
+        This function requires the PoshRSJob module to be installed.
 
     .PARAMETER ComputerName
-        One or more computer names to query. Accepts pipeline input.
+        One or more computer names to query. Defaults to the local machine. Accepts pipeline input.
 
     .PARAMETER IdleTime
-        The time threshold to consider a user session as idle. Defaults to 1 hour. Any session (including disconnected) with an idle time
-        at or above this value will contribute to an overall 'Idle' state.
+        The time threshold to consider a user session as idle. Defaults to 1 hour.
 
     .PARAMETER Clipboard
         A switch to get computer names from the system clipboard.
@@ -35,26 +34,11 @@ function Get-QuserStateParallel {
     .EXAMPLE
         PS C:\> Get-QuserStateParallel -ComputerName 'SERVER01', 'WKSTN05'
 
-        Name            State           Timestamp             SessionCount Session
-        ----            -----           ---------             ------------ -------
-        SERVER01        Active          7/12/2025 11:09:15 AM            2 {@{Id=1; UserName=jdoe; ...}, @{Id=2; UserName=asmith; ...}}
-        WKSTN05         Empty           7/12/2025 11:09:16 AM            0
-
-        Queries two computers and returns their state.
-
-    .EXAMPLE
-        PS C:\> 'SERVER01', 'SERVER02', 'SERVER03' | Get-QuserStateParallel -IdleTime '00:15:00' -Throttle 32
-
-        Pipes computer names to the function, setting a custom idle threshold of 15 minutes and a throttle limit of 32.
-
-    .EXAMPLE
-        PS C:\> Get-QuserStateParallel -Clipboard
-
-        Runs a query against the list of computer names currently on the clipboard.
+        Queries two computers and returns their state, including any relevant idle timer properties.
 
     .OUTPUT
         [PSCustomObject]
-        An object for each computer with its Name, overall State, Timestamp of the query, SessionCount, and the detailed Session object(s).
+        An object for each computer with its calculated state and session details.
     #>
     [CmdletBinding(DefaultParameterSetName = 'Default')]
     param(
@@ -62,7 +46,7 @@ function Get-QuserStateParallel {
             ValueFromPipeline,
             ValueFromPipelineByPropertyName,
             Position = 0)]
-        [alias('Name')]
+        [alias('__ServerName', 'ServerName', 'Server', 'Computer', 'Name', 'CN')]
         [ValidateNotNullOrEmpty()]
         [string[]]$ComputerName = $env:computername,
 
@@ -75,68 +59,61 @@ function Get-QuserStateParallel {
 
     begin {
         # --- Input Processing ---
-        # If the -Clipboard switch is used, get computer names from the clipboard.
-        # Filter out any empty or whitespace-only lines.
         if ($Clipboard.IsPresent) {
             $ComputerName = Get-Clipboard | Where-Object { $_ -and $_.Trim() -ne '' }
         }
 
-        # Unless specified otherwise, convert all names to lowercase and remove duplicates for efficiency.
         if (-not $KeepDuplicates.IsPresent) {
+            # Standardize to lowercase and remove duplicates.
             $ComputerName = $ComputerName | ForEach-Object { $_.ToLower() } | Sort-Object | Get-Unique
         }
 
-        # If after processing input there are no computer names, stop execution.
         if (-not $ComputerName) {
             Write-Error "No computer names were provided. Please specify names via the -ComputerName parameter, -Clipboard switch, or pipeline."
             return
         }
 
-        # Generate a unique ID for this run to prevent job name collisions if the function
-        # is called multiple times in the same session.
+        # Use a GUID to ensure job names are unique for each run.
         $jobGuid = (New-Guid).ToString()
     }
 
     process {
         # --- Parallel Job Execution ---
-        # Pipe each computer name to Start-RSJob to process them in parallel.
         $ComputerName | Start-RSJob -Name "QuserStateJob-$jobGuid" -Throttle $Throttle -ScriptBlock {
-            # This scriptblock runs on a separate thread for each computer.
             param($ComputerName_Item)
 
-            # Clear the thread's error buffer to ensure we only check for errors from the Get-Quser command.
+            # Clear previous errors on this thread.
             $Error.Clear()
 
-            # Execute the query. We use -WarningAction SilentlyContinue to suppress non-terminating warnings
-            # from quser.exe that would otherwise clutter the console.
             $sessions = Get-Quser -Server $ComputerName_Item -WarningAction SilentlyContinue
-
-            # Capture the timestamp immediately after the query.
             $timestamp = Get-Date
 
             # --- Result Analysis ---
             if ($sessions) {
-                # This block runs if Get-Quser returned one or more session objects.
-
                 # --- State Logic ---
-                # The goal is to determine a single, overall state for the computer based on its sessions.
 
-                # Condition 1: Is there at least one 'Active' user whose idle time is below the threshold?
-                # This is the primary indicator of an active machine.
-                $hasActiveUsers = $sessions | Where-Object { $_.State -eq 'Active' -and ($null -eq $_.IdleTime -or $_.IdleTime -lt [timespan]$using:IdleTime) }
+                # Define a threshold for an unreasonably large idle time to detect the quser.exe bug.
+                $buggedIdleTimeThreshold = [timespan]::FromDays(365)
 
-                # Condition 2: Are ALL sessions (including 'Disc') idle for longer than the threshold?
-                # This defines the 'Idle' state. A session is considered idle if its IdleTime exceeds the threshold, regardless of its state.
+                # Condition 1: Check for any active users. A user is considered active if their state is 'Active' and their idle time
+                # is either below the threshold OR above the bugged threshold (working around the quser bug).
+                $hasActiveUsers = $sessions | Where-Object {
+                    $_.State -eq 'Active' -and (
+                        ($null -eq $_.IdleTime) -or
+                        ($_.IdleTime -lt [timespan]$using:IdleTime) -or
+                        ($_.IdleTime -gt $buggedIdleTimeThreshold)
+                    )
+                }
+
                 $areAllSessionsIdle = -not ($sessions | Where-Object { $_.IdleTime -lt [timespan]$using:IdleTime })
-
-                # Condition 3: Are ALL sessions in the 'Disc' state?
-                # This is a fallback for when a machine has only disconnected users who have NOT yet met the idle threshold.
                 $areAllDisconnected = -not ($sessions | Where-Object { $_.State -ne 'Disc' })
 
-                # Build the output object.
+                # --- Build Output Object ---
                 $resultObject = [PSCustomObject]@{
                     Name         = $ComputerName_Item
-                    State        = 'Mixed' # Default to 'Mixed' and overwrite based on the logic below.
+                    State        = 'Mixed' # Default state
+                    IdleDuration = $null
+                    TimeToIdle   = $null
                     Timestamp    = $timestamp
                     SessionCount = @($sessions).Count
                     Session      = $sessions
@@ -147,67 +124,60 @@ function Get-QuserStateParallel {
                 }
                 elseif ($areAllSessionsIdle) {
                     $resultObject.State = 'Idle'
+                    # Calculate the server's total idle duration.
+                    # This is based on the session that has been idle the least amount of time.
+                    $minIdleTime = ($sessions.IdleTime | Measure-Object -Minimum).Minimum
+                    $resultObject.IdleDuration = $minIdleTime
                 }
                 elseif ($areAllDisconnected) {
                     $resultObject.State = 'Disc'
                 }
-                # If none of the above specific states match, the state remains 'Mixed'.
+
+                # For 'Disc' or 'Mixed' states, calculate the time remaining until the server becomes idle.
+                if ($resultObject.State -in @('Disc', 'Mixed')) {
+                    $minIdleTime = ($sessions.IdleTime | Where-Object { $_ } | Measure-Object -Minimum).Minimum
+                    if ($null -ne $minIdleTime) {
+                         $resultObject.TimeToIdle = $using:IdleTime - $minIdleTime
+                    }
+                }
 
                 return $resultObject
             }
             else {
-                # This block runs if Get-Quser returned nothing ($null), which indicates either an error or no sessions.
-                # We inspect the $Error automatic variable because native executable errors (like from quser.exe)
-                # often don't throw terminating script errors that a try/catch block would handle.
-
+                # This block handles cases where Get-Quser returned no sessions, either due to an error or an empty server.
                 $lastError = $Error[0]
-
-                if ($lastError -and $lastError.Exception.Message -like '*No User exists for*') {
-                    # The command succeeded but found no logged-on users.
-                    [PSCustomObject]@{
-                        Name         = $ComputerName_Item
-                        State        = 'Empty'
-                        Timestamp    = $timestamp
-                        SessionCount = 0
-                        Session      = $null
-                    }
+                $state = if ($lastError -and $lastError.Exception.Message -like '*No User exists for*') {
+                    'Empty'
                 }
                 elseif ($lastError -and $lastError.Exception.Message -like '*The RPC server is unavailable*') {
-                    # A common network/firewall error indicating the remote machine could not be contacted.
-                    [PSCustomObject]@{
-                        Name         = $ComputerName_Item
-                        State        = 'RPC Unavailable'
-                        Timestamp    = $timestamp
-                        SessionCount = 0
-                        Session      = $null
-                    }
+                    'RPC Unavailable'
                 }
                 else {
-                    # A different, unexpected error occurred.
-                    [PSCustomObject]@{
-                        Name         = $ComputerName_Item
-                        State        = "Error: $($lastError.Exception.GetBaseException().Message)"
-                        Timestamp    = $timestamp
-                        SessionCount = 0
-                        Session      = $null
-                    }
+                    "Error: $($lastError.Exception.GetBaseException().Message)"
+                }
+
+                # Build the error/empty object
+                [PSCustomObject]@{
+                    Name         = $ComputerName_Item
+                    State        = $state
+                    IdleDuration = $null
+                    TimeToIdle   = $null
+                    Timestamp    = $timestamp
+                    SessionCount = 0
+                    Session      = $null
                 }
             }
-        } | Out-Null # Suppress the job objects that Start-RSJob outputs to the pipeline.
+        } | Out-Null # Suppress job objects from Start-RSJob output
     }
 
     end {
         # --- Job Cleanup and Output ---
-        # Wait for all jobs created during this run to complete.
         $allJobs = Get-RSJob -Name "QuserStateJob-$jobGuid"
         if ($allJobs) {
-            # Wait for jobs to finish, showing a progress bar, and then receive the results.
             $results = $allJobs | Wait-RSJob -ShowProgress -Timeout $QueryTimeout | Receive-RSJob
-
-            # Clean up by removing the completed jobs.
             $allJobs | Remove-RSJob -Force
 
-            # Return the collected results, sorted by name for consistent output.
+            # Return final results, sorted by name for consistency.
             return $results | Sort-Object -Property Name
         }
     }

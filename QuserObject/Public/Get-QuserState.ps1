@@ -36,7 +36,7 @@
         Get-ADComputer 'ThisServer' | Get-QuserState
 
     .NOTES
-    
+
         Author: Harold Kammermeyer
 #>
 function Get-QuserState {
